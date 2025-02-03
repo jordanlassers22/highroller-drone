@@ -2,6 +2,8 @@ import cv2
 import pygame
 from djitellopy import Tello
 import logging
+import time
+import threading
 
 
 #Pygame setup for important variables and environment
@@ -25,7 +27,7 @@ print("Initializing Tello drone...")
 
 drone = Tello()
 drone.connect()
-drone.streamon()  #Enable video streaming
+#drone.streamon()  #Enable video streaming
 print(f"Battery life: {drone.get_battery()}")
 
 #Set logging level for djitellopy to WARNING and above to prevent console clutter
@@ -43,6 +45,69 @@ velocity_z = 0
 rotation_velocity = 0
 
 FPS = 30  #Frame rate for the game loop
+
+class CameraThread:
+    def __init__(self, drone):
+        self.drone = drone
+        self.frame = None
+        self.running = False
+        self.thread = threading.Thread(target=self.update, daemon=True)
+
+    def start(self):
+        self.running = True
+        self.drone.streamon()
+        self.thread.start()
+
+    def update(self):
+        while self.running:
+            try:
+                frame = self.drone.get_frame_read().frame
+                if frame is not None:
+                    frame = cv2.flip(frame, 1)  #Flip to match screen orientation
+                    self.frame = frame
+            except Exception as e:
+                print(f"Error in camera thread: {e}")
+
+    def get_frame(self):
+        return self.frame
+
+    def stop(self):
+        self.running = False
+        self.drone.streamoff()
+        self.thread.join()
+        
+class DroneMovementThread:
+    def __init__(self, drone):
+        self.drone = drone
+        self.running = True
+        self.velocity_x = 0
+        self.velocity_y = 0
+        self.velocity_z = 0
+        self.rotation_velocity = 0
+        self.thread = threading.Thread(target=self.update, daemon=True)
+        self.thread.start()
+
+    def update(self):
+        """Continuously sends movement commands to the drone without blocking the main loop."""
+        while self.running:
+            try:
+                self.drone.send_rc_control(
+                    self.velocity_x, self.velocity_y, self.velocity_z, self.rotation_velocity
+                )
+                time.sleep(0.05)  # Prevent excessive CPU usage
+            except Exception as e:
+                print(f"Error in movement thread: {e}")
+
+    def stop(self):
+        self.running = False
+        self.thread.join()
+
+# Initialize movement thread
+movement_thread = DroneMovementThread(drone)
+
+
+# Initialize camera thread
+camera_thread = CameraThread(drone)
 
 
 #Create a font for text dashboard
@@ -216,10 +281,13 @@ try:
                 if event.key == pygame.K_TAB:
                     show_logo = not show_logo
                 
-                    if show_logo:
+                    if show_logo:  
                         print("Turning Camera Off...")
-                    else:  #If switching back to camera, start the stream only if it's off
+                        camera_thread.stop()  # ✅ Proper way to stop the camera thread
+                    else:
                         print("Turning Camera On...")
+                        camera_thread.start()  # ✅ Proper way to start the camera thread
+
                                 
                 #Toggle hud.
                 if event.key == pygame.K_h:
@@ -341,37 +409,28 @@ try:
             key_states[pygame.K_e] = False
             rotation_velocity = 0
         
-        #Send command to drone
-        try:
-            drone.send_rc_control(velocity_x, velocity_y, velocity_z, rotation_velocity)
-        except Exception as e:
-            print(f"Error sending RC control: {e}")
+        # Update movement thread values instead of sending commands directly
+        movement_thread.velocity_x = 100 if keys[pygame.K_d] else -100 if keys[pygame.K_a] else 0
+        movement_thread.velocity_y = 100 if keys[pygame.K_w] else -100 if keys[pygame.K_s] else 0
+        movement_thread.velocity_z = 100 if keys[pygame.K_SPACE] else -100 if keys[pygame.K_LCTRL] else 0
+        movement_thread.rotation_velocity = 100 if keys[pygame.K_e] else -100 if keys[pygame.K_q] else 0
+
                 
     ###############################################################################
     
         #Display either the logo or the drone's video feed
         if show_logo:
-            #Adjust logo position and scaling to fit above the dashboard
-            adjusted_logo_rect = logo_surface.get_rect()
-            adjusted_logo_rect.center = (SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2)
-            screen.blit(logo_surface, adjusted_logo_rect)
+            screen.blit(logo_surface, logo_rect)
         else:
-            #Capture the video feed from the drone
-            frame = drone.get_frame_read().frame
-            if frame is None: 
-                print("Error: Unable to read frame from Tello camera.")
-                continue
-            
-            #Flip frame about yaxis
-            frame = cv2.flip(frame, 1)
-    
-            #Create a Pygame surface from the frame
-            drone_surface = pygame.surfarray.make_surface(frame)
-    
-            #Rotate and scale the drone surface to fit the screen minus the dashboard
-            drone_surface = pygame.transform.rotate(drone_surface, -90)
-            drone_surface = pygame.transform.scale(drone_surface, (SCREEN_WIDTH, SCREEN_HEIGHT))
-            screen.blit(drone_surface, (0, 0))
+            frame = camera_thread.get_frame()
+            if frame is not None:
+                #Create a Pygame surface from the frame
+                drone_surface = pygame.surfarray.make_surface(frame)
+        
+                #Rotate and scale the drone surface to fit the screen minus the dashboard
+                drone_surface = pygame.transform.rotate(drone_surface, -90)
+                drone_surface = pygame.transform.scale(drone_surface, (SCREEN_WIDTH, SCREEN_HEIGHT))
+                screen.blit(drone_surface, (0, 0))
             
         #Show Hud if toggled
         if show_hud:
@@ -399,8 +458,10 @@ except KeyboardInterrupt:
 finally:
     #Shut down the Tello and Pygame
     drone.send_rc_control(0, 0, 0, 0)
-    drone.streamoff()
-    print("Turning off camera stream...")
+    camera_thread.stop()  # ✅ This safely stops the camera thread and the drone stream
+    movement_thread.stop()  # ✅ Stop movement thread
+    camera_thread.stop()  # ✅ Stop camera thread
+    drone.send_rc_control(0, 0, 0, 0)  # ✅ Make sure the drone stops moving
     drone.end()
     print("Terminating drone connection...")
     pygame.quit()
